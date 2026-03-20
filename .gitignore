@@ -1,0 +1,28 @@
+/memes/**
+!/memes/.placeholder
+
+/settings.local.json
+
+/pages/**
+!/pages/.placeholder
+/__pycache__/**
+
+# Agents and tools
+/kanban/**
+/journal/**
+/agents/**
+/templates/**
+/references/**
+/playbooks/**
+
+# Build/runtime logs
+*.log
+
+# Jekyll build artifacts
+_site/
+.sass-cache/
+*.html
+/index.md
+*.ipynb
+logo.png
+logo.jpg
