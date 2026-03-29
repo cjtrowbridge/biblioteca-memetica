@@ -797,6 +797,7 @@ def process_analysis_job(
     attempted = 0
     written = 0
     failed = 0
+    skipped_missing = 0
 
     for index, (asset, out_path) in enumerate(pending, start=1):
         attempted += 1
@@ -810,6 +811,10 @@ def process_analysis_job(
             prompt = compose_prompt_for_asset(job["prompt"], asset)
             try:
                 text = request_ai_analysis(asset, settings, job["model"], prompt, timeout_seconds=job["timeout_seconds"]).strip()
+            except FileNotFoundError:
+                skipped_missing += 1
+                status = "missing"
+                print(f"  skipped ({job['kind']}) missing file: {asset.rel_path}")
             except RuntimeError as exc:
                 failed += 1
                 status = "failed"
@@ -841,7 +846,7 @@ def process_analysis_job(
 
     total_elapsed = time.perf_counter() - phase_start
     print(
-        f"{phase_name} complete: attempted {attempted}; wrote {written}; failed {failed}; elapsed={format_duration(total_elapsed)}"
+        f"{phase_name} complete: attempted {attempted}; wrote {written}; failed {failed}; skipped_missing {skipped_missing}; elapsed={format_duration(total_elapsed)}"
     )
     return (attempted, written, failed)
 
