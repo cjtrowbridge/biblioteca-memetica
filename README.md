@@ -13,7 +13,7 @@ This project builds a static website from local meme folders.
   - static category index pages with pagination: `memes/<Topic>/index.html`, `memes/<Topic>/pages/<n>/index.html`
   - static homepage feed with pagination: `index.html`, `pages/<n>/index.html`
   - sidebar include generated at build time: `_includes/categories.html` (Freshest Memes section + All Categories section)
-  - homepage/category cards show one-line metadata: topic link + relative posted time (hover on posted time to see exact timestamp); meme detail pages render all metadata artifacts with First Seen pinned first
+  - homepage/category cards show one-line metadata: topic link + relative posted-time link to the meme detail page (hover on posted time to see exact timestamp); meme detail pages render all metadata artifacts with First Seen pinned first
 
 ## Build Script
 
@@ -24,7 +24,7 @@ First run creates `settings.local.json` (ignored by git) and prompts for:
 - site name and URL
 - memes root path
 - pagination size
-- Ollama API URL and per-analysis models (simple + detailed) for optional AI artifact generation
+- Ollama API URL plus per-analysis host/model settings (simple + detailed) for optional AI artifact generation
 
 Run:
 
@@ -36,7 +36,9 @@ Useful options:
 
 ```bash
 python build.py --summaries off
-python build.py --summaries on
+python build.py --summaries simple
+python build.py --summaries detailed
+python build.py --summaries simple,detailed
 python build.py --page-size 48
 python build.py --max-topics 5
 python build.py --dry-run
@@ -49,22 +51,23 @@ python build.py --jekyll on
 Run this to generate any missing simple/detailed AI artifacts across the full library:
 
 ```bash
-python build.py --non-interactive --summaries on --log-file build-cron.log
+python build.py --non-interactive --summaries simple,detailed --log-file build-cron.log
 ```
 
 Behavior:
-- The script processes simple descriptions first, then detailed summaries.
+- The script processes simple descriptions first, then detailed summaries (when both analysis types are enabled).
 - Each phase starts by counting missing artifacts for that phase.
 - Processing order is newest to oldest across all image posts.
 - Progress is printed for every item with elapsed time and ETA.
 - `--max-topics` now only limits summary generation scope; site rendering/rebuild still uses all topics.
 - Failures are isolated per artifact (the build continues).
 - Any artifact that fails remains missing, so the next run retries it automatically.
+- `--summaries` accepts a CSV list of analysis types to run: `simple`, `detailed`, or `simple,detailed`.
 
 Optional Jekyll stage:
 
 ```bash
-python build.py --non-interactive --summaries on --jekyll on --log-file build-cron.log
+python build.py --non-interactive --summaries simple,detailed --jekyll on --log-file build-cron.log
 ```
 
 - `--jekyll auto` (default): run only when `_config.yml` exists and a jekyll command is available.
@@ -76,7 +79,12 @@ python build.py --non-interactive --summaries on --jekyll on --log-file build-cr
 - Every build run writes to `build.log` by default while still printing to the console.
 - Terminal output is flushed to the log immediately (line-by-line/live) during execution.
 - Use `--log-file <path>` to override the output path (useful for cron jobs).
+- Every Ollama API call appends one CSV row to `profiler.txt` in repo root: `analysis_type,provider_fqdn,model,response_code,runtime_seconds`.
+- The profiler records one row per call attempt, so retries are captured as additional rows.
+- `profiler.txt` includes a CSV header row on first write.
 - `ai.timeout_seconds` is the global timeout fallback.
+- `ai.analyses.simple.url` overrides the Ollama host for simple-description calls.
+- `ai.analyses.detailed.url` overrides the Ollama host for detailed-analysis calls.
 - `ai.analyses.simple.timeout_seconds` overrides the simple-description timeout.
 - `ai.analyses.detailed.timeout_seconds` overrides the detailed-analysis timeout.
 - For `gemma3:27b-it-q8_0`, detailed analysis can take several minutes. A tested run completed in about 512 seconds, so `600` is safer than `300`.

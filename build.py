@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import json
 import shutil
 import re
@@ -17,7 +18,7 @@ from http.client import RemoteDisconnected
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -28,8 +29,10 @@ except ImportError:
 TRACKED_EXTS = {".gif", ".jfif", ".jpeg", ".jpg", ".mp4", ".png", ".svg", ".webp", ".avif", ".bmp", ".mov", ".m4v", ".webm"}
 IMAGE_EXTS = {".avif", ".bmp", ".gif", ".jfif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
 VIDEO_EXTS = {".m4v", ".mov", ".mp4", ".webm"}
+SUMMARY_KEYS = ("simple", "detailed")
 INCLUDE_PATTERN = re.compile(r"{%\s*include\s+'([^']+)'\s*%}")
 DEFAULT_SETTINGS_FILE = "settings.local.json"
+PROFILER_FILE_NAME = "profiler.txt"
 AI_KIND_SIMPLE = "simple-description"
 AI_KIND_DETAILED = "detailed-analysis"
 LEGACY_SIMPLE_LABELS = {"llama3.2-vision", "llama-3.2-vision", "qwen2.5vl", "vision", "qwen3.5-9b"}
@@ -56,14 +59,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
             "simple": {
                 "enabled": True,
                 "analysis_type": AI_KIND_SIMPLE,
-                "model": "gemma3:27b-it-q8_0",
+                "url": "http://xavier:11434/api/generate",
+                "model": "qwen3.5:4b-q8_0",
                 "prompt": SIMPLE_PROMPT,
                 "timeout_seconds": 300,
             },
             "detailed": {
                 "enabled": True,
                 "analysis_type": AI_KIND_DETAILED,
-                "model": "gemma3:27b-it-q8_0",
+                "url": "http://xavier:11434/api/generate",
+                "model": "qwen3.6:35b-a3b-q8_0",
                 "prompt": DETAILED_PROMPT,
                 "timeout_seconds": 600,
             },
@@ -130,10 +135,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--settings-file", default=DEFAULT_SETTINGS_FILE)
     p.add_argument("--log-file", default="build.log")
     p.add_argument("--non-interactive", action="store_true")
-    p.add_argument("--summaries", choices=["auto", "on", "off"], default="auto")
+    p.add_argument(
+        "--summaries",
+        default="off",
+        help="Comma-separated analyses to run: simple,detailed (default: off).",
+    )
     p.add_argument("--jekyll", choices=["auto", "on", "off"], default="auto")
     p.add_argument("--page-size", type=int, default=None)
     p.add_argument("--max-topics", type=int, default=None, help="Limit AI summary generation to first N topics (site rendering still uses all topics).")
+    p.add_argument(
+        "--max-inference-tasks",
+        type=int,
+        default=None,
+        help="Limit total AI inference tasks processed this run across all selected analyses.",
+    )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -284,10 +299,11 @@ def analysis_configs(settings: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         default_kind = AI_KIND_SIMPLE if key == "simple" else AI_KIND_DETAILED if key == "detailed" else key
         kind = sanitize_analysis_type(raw_cfg.get("analysis_type", default_kind), default_kind)
+        url = str(raw_cfg.get("url", "")).strip()
         model = str(raw_cfg.get("model", "")).strip()
         prompt = str(raw_cfg.get("prompt", "")).strip()
         timeout_seconds = positive_int(raw_cfg.get("timeout_seconds", default_timeout), default_timeout)
-        if not model or not prompt:
+        if not url or not model or not prompt:
             continue
         model_root = sanitize_model_name(model)
         configs.append(
@@ -295,6 +311,7 @@ def analysis_configs(settings: dict[str, Any]) -> list[dict[str, Any]]:
                 "key": key,
                 "enabled": bool(raw_cfg.get("enabled", True)),
                 "kind": kind,
+                "url": url,
                 "model": model,
                 "model_root": model_root,
                 "prompt": prompt,
@@ -304,6 +321,46 @@ def analysis_configs(settings: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return configs
+
+
+def parse_summary_selection(raw_value: str) -> set[str]:
+    raw = str(raw_value).strip().lower()
+    if not raw or raw == "off":
+        return set()
+
+    selected: set[str] = set()
+    invalid: list[str] = []
+    for part in raw.split(","):
+        token = part.strip().lower()
+        if not token:
+            continue
+        if token in SUMMARY_KEYS:
+            selected.add(token)
+        else:
+            invalid.append(token)
+
+    if invalid:
+        allowed = ",".join(SUMMARY_KEYS)
+        invalid_text = ",".join(invalid)
+        raise ValueError(f"Invalid --summaries value '{raw_value}'. Use a CSV list from: {allowed} (or 'off'). Invalid: {invalid_text}")
+    return selected
+
+
+def selected_analysis_jobs(settings: dict[str, Any], selected_keys: set[str]) -> list[dict[str, Any]]:
+    if not selected_keys:
+        return []
+
+    jobs = [dict(cfg) for cfg in analysis_configs(settings) if str(cfg.get("key", "")) in selected_keys]
+    configured_keys = {str(job.get("key", "")) for job in jobs}
+    missing = sorted(selected_keys - configured_keys)
+    if missing:
+        missing_text = ",".join(missing)
+        raise RuntimeError(f"Requested summary types are not configured: {missing_text}")
+
+    for job in jobs:
+        job["enabled"] = True
+    jobs.sort(key=analysis_job_priority)
+    return jobs
 
 
 def compose_prompt_for_asset(prompt_template: str, asset: Asset) -> str:
@@ -407,6 +464,8 @@ def normalize_settings(settings: dict[str, Any]) -> dict[str, Any]:
     raw_analyses = ai.get("analyses")
     if not isinstance(raw_analyses, dict):
         raw_analyses = {}
+    source_ai = settings.get("ai") if isinstance(settings.get("ai"), dict) else {}
+    source_analyses = source_ai.get("analyses") if isinstance(source_ai.get("analyses"), dict) else {}
 
     default_analyses = DEFAULT_SETTINGS["ai"]["analyses"]
     merged_analyses: dict[str, dict[str, Any]] = {}
@@ -426,10 +485,16 @@ def normalize_settings(settings: dict[str, Any]) -> dict[str, Any]:
         raw_cfg = raw_analyses.get(key)
         if not isinstance(raw_cfg, dict):
             raw_cfg = {}
+        source_cfg = source_analyses.get(key) if isinstance(source_analyses.get(key), dict) else {}
         cfg = deep_merge(default_cfg, raw_cfg)
         default_kind = default_cfg.get("analysis_type", key)
         cfg["enabled"] = bool(cfg.get("enabled", True))
         cfg["analysis_type"] = sanitize_analysis_type(cfg.get("analysis_type", default_kind), default_kind)
+        raw_url = str(source_cfg.get("url", "")).strip() if "url" in source_cfg else ""
+        cfg_url = normalize_ollama_url(raw_url)
+        if not cfg_url:
+            cfg_url = ai["url"]
+        cfg["url"] = cfg_url
         cfg["model"] = str(cfg.get("model", default_cfg.get("model", ""))).strip() or str(default_cfg.get("model", "")).strip()
         cfg["prompt"] = str(cfg.get("prompt", default_cfg.get("prompt", ""))).strip() or str(default_cfg.get("prompt", "")).strip()
         cfg["timeout_seconds"] = positive_int(cfg.get("timeout_seconds", ai["timeout_seconds"]), ai["timeout_seconds"])
@@ -461,6 +526,7 @@ def write_if_changed(path: Path, content: str, dry_run: bool = False) -> bool:
 
 
 def create_settings(settings_path: Path, non_interactive: bool, dry_run: bool) -> dict[str, Any]:
+    ai_url = prompt_text("Ollama API URL", DEFAULT_SETTINGS["ai"]["url"], non_interactive)
     settings = deep_merge(
         DEFAULT_SETTINGS,
         {
@@ -475,11 +541,12 @@ def create_settings(settings_path: Path, non_interactive: bool, dry_run: bool) -
             },
             "ai": {
                 "enabled": prompt_bool("Enable AI analysis generation by default?", DEFAULT_SETTINGS["ai"]["enabled"], non_interactive),
-                "url": prompt_text("Ollama API URL", DEFAULT_SETTINGS["ai"]["url"], non_interactive),
+                "url": ai_url,
                 "analyses": {
                     "simple": {
                         "enabled": True,
                         "analysis_type": AI_KIND_SIMPLE,
+                        "url": prompt_text("Simple analysis Ollama API URL", ai_url, non_interactive),
                         "model": prompt_text(
                             "Simple analysis model",
                             DEFAULT_SETTINGS["ai"]["analyses"]["simple"]["model"],
@@ -490,6 +557,7 @@ def create_settings(settings_path: Path, non_interactive: bool, dry_run: bool) -
                     "detailed": {
                         "enabled": True,
                         "analysis_type": AI_KIND_DETAILED,
+                        "url": prompt_text("Detailed analysis Ollama API URL", ai_url, non_interactive),
                         "model": prompt_text(
                             "Detailed analysis model",
                             DEFAULT_SETTINGS["ai"]["analyses"]["detailed"]["model"],
@@ -699,10 +767,46 @@ def collect_assets(repo_root: Path, settings: dict[str, Any], max_topics: int | 
     return out
 
 
-def request_ai_analysis(asset: Asset, settings: dict[str, Any], model: str, prompt: str, timeout_seconds: int | None = None) -> str:
+def provider_fqdn_from_url(request_url: str) -> str:
+    parsed = urlparse(str(request_url).strip())
+    if parsed.hostname:
+        return parsed.hostname
+    return str(request_url).strip()
+
+
+def append_profiler_row(
+    analysis_type: str,
+    provider_fqdn: str,
+    model: str,
+    response_code: str,
+    runtime_seconds: float,
+    profiler_path: Path | None = None,
+) -> None:
+    path = profiler_path or (Path(__file__).resolve().parent / PROFILER_FILE_NAME)
+    try:
+        write_header = (not path.exists()) or path.stat().st_size == 0
+        with path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            if write_header:
+                writer.writerow(["analysis_type", "provider_fqdn", "model", "response_code", "runtime_seconds"])
+            writer.writerow([analysis_type, provider_fqdn, model, response_code, f"{runtime_seconds:.6f}"])
+    except OSError as exc:
+        print(f"  profiler write failed: {exc}")
+
+
+def request_ai_analysis(
+    asset: Asset,
+    settings: dict[str, Any],
+    request_url: str,
+    model: str,
+    prompt: str,
+    analysis_type: str,
+    timeout_seconds: int | None = None,
+) -> str:
     image_b64 = base64.b64encode(asset.abs_path.read_bytes()).decode("ascii")
     ai_settings = settings["ai"]
-    url = str(ai_settings["url"]).strip()
+    url = str(request_url).strip()
+    provider_fqdn = provider_fqdn_from_url(url)
     api_is_chat = url.rstrip("/").endswith("/api/chat")
 
     if api_is_chat:
@@ -732,8 +836,11 @@ def request_ai_analysis(asset: Asset, settings: dict[str, Any], model: str, prom
 
     for attempt in range(1, retries + 1):
         req = Request(url=url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        call_start = time.perf_counter()
+        response_code = "NO_RESPONSE"
         try:
             with urlopen(req, timeout=timeout) as resp:
+                response_code = str(getattr(resp, "status", "") or resp.getcode() or "UNKNOWN")
                 data = json.loads(resp.read().decode("utf-8"))
             if api_is_chat:
                 text = str((data.get("message") or {}).get("content", "")).strip()
@@ -744,12 +851,21 @@ def request_ai_analysis(asset: Asset, settings: dict[str, Any], model: str, prom
             if text:
                 return text
             raise RuntimeError("empty model response")
-        except (HTTPError, URLError, TimeoutError, RemoteDisconnected, ConnectionError, OSError, json.JSONDecodeError, RuntimeError) as exc:
+        except HTTPError as exc:
+            response_code = str(getattr(exc, "code", "") or "HTTP_ERROR")
             if attempt == retries:
                 raise RuntimeError(f"Failed analysis for {asset.abs_path}: {exc}") from exc
             wait = backoff * attempt
             print(f"  retry {attempt}/{retries} after error: {exc}")
             time.sleep(wait)
+        except (URLError, TimeoutError, RemoteDisconnected, ConnectionError, OSError, json.JSONDecodeError, RuntimeError) as exc:
+            if attempt == retries:
+                raise RuntimeError(f"Failed analysis for {asset.abs_path}: {exc}") from exc
+            wait = backoff * attempt
+            print(f"  retry {attempt}/{retries} after error: {exc}")
+            time.sleep(wait)
+        finally:
+            append_profiler_row(analysis_type, provider_fqdn, model, response_code, time.perf_counter() - call_start)
 
     raise RuntimeError(f"Failed analysis for {asset.abs_path}")
 
@@ -810,7 +926,15 @@ def process_analysis_job(
         else:
             prompt = compose_prompt_for_asset(job["prompt"], asset)
             try:
-                text = request_ai_analysis(asset, settings, job["model"], prompt, timeout_seconds=job["timeout_seconds"]).strip()
+                text = request_ai_analysis(
+                    asset,
+                    settings,
+                    job["url"],
+                    job["model"],
+                    prompt,
+                    job["kind"],
+                    timeout_seconds=job["timeout_seconds"],
+                ).strip()
             except FileNotFoundError:
                 skipped_missing += 1
                 status = "missing"
@@ -854,17 +978,13 @@ def process_analysis_job(
 def maybe_generate_ai_artifacts(
     assets_by_topic: dict[str, list[Asset]],
     settings: dict[str, Any],
-    enabled: bool,
+    analysis_jobs: list[dict[str, Any]],
     dry_run: bool,
+    max_inference_tasks: int | None = None,
 ) -> tuple[int, int, int]:
-    if not enabled:
-        return (0, 0, 0)
-
-    analysis_jobs = [cfg for cfg in analysis_configs(settings) if cfg["enabled"]]
     if not analysis_jobs:
         return (0, 0, 0)
 
-    analysis_jobs.sort(key=analysis_job_priority)
     image_assets = flatten_image_assets(assets_by_topic)
     if not image_assets:
         return (0, 0, 0)
@@ -872,8 +992,13 @@ def maybe_generate_ai_artifacts(
     attempted_total = 0
     written_total = 0
     failed_total = 0
+    remaining_tasks = None if max_inference_tasks is None else max(0, int(max_inference_tasks))
 
     for job in analysis_jobs:
+        if remaining_tasks is not None and remaining_tasks <= 0:
+            print("Inference task limit reached; skipping remaining analysis jobs.")
+            break
+
         if job["kind"] == AI_KIND_SIMPLE:
             phase_name = "Basic descriptions"
         elif job["kind"] == AI_KIND_DETAILED:
@@ -882,11 +1007,16 @@ def maybe_generate_ai_artifacts(
             phase_name = f"{job['kind']} summaries"
 
         pending = pending_assets_for_job(image_assets, job)
+        if remaining_tasks is not None and len(pending) > remaining_tasks:
+            print(f"{phase_name} capped by --max-inference-tasks: {remaining_tasks}/{len(pending)} pending tasks will run.")
+            pending = pending[:remaining_tasks]
         print(f"{phase_name} pending count: {len(pending)}")
         attempted, written, failed = process_analysis_job(phase_name, pending, job, settings, dry_run)
         attempted_total += attempted
         written_total += written
         failed_total += failed
+        if remaining_tasks is not None:
+            remaining_tasks = max(0, remaining_tasks - attempted)
 
     return (attempted_total, written_total, failed_total)
 
@@ -1100,6 +1230,68 @@ def render_markdown_inline_fallback(text: str) -> str:
     return safe
 
 
+def render_markdown_blocks_fallback(text: str) -> str:
+    lines = text.replace("\r\n", "\n").split("\n")
+    rendered: list[str] = []
+    paragraph_lines: list[str] = []
+    list_items: list[str] = []
+    list_mode: str | None = None
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph_lines
+        if not paragraph_lines:
+            return
+        body = "<br />".join(render_markdown_inline_fallback(line) for line in paragraph_lines)
+        rendered.append(f"<p>{body}</p>")
+        paragraph_lines = []
+
+    def flush_list() -> None:
+        nonlocal list_items, list_mode
+        if not list_items:
+            return
+        tag = "ol" if list_mode == "ol" else "ul"
+        rendered.append(f"<{tag}>")
+        rendered.extend(f"<li>{item}</li>" for item in list_items)
+        rendered.append(f"</{tag}>")
+        list_items = []
+        list_mode = None
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            flush_paragraph()
+            flush_list()
+            continue
+
+        heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        if heading:
+            flush_paragraph()
+            flush_list()
+            level = len(heading.group(1))
+            text = render_markdown_inline_fallback(heading.group(2).strip())
+            rendered.append(f"<h{level}>{text}</h{level}>")
+            continue
+
+        unordered = re.match(r"^[-*]\s+(.+)$", stripped)
+        ordered = re.match(r"^\d+\.\s+(.+)$", stripped)
+        if unordered or ordered:
+            flush_paragraph()
+            next_mode = "ul" if unordered else "ol"
+            if list_mode is not None and list_mode != next_mode:
+                flush_list()
+            list_mode = next_mode
+            item_text = (unordered or ordered).group(1).strip()
+            list_items.append(render_markdown_inline_fallback(item_text))
+            continue
+
+        flush_list()
+        paragraph_lines.append(stripped)
+
+    flush_paragraph()
+    flush_list()
+    return "\n".join(rendered)
+
+
 def render_markdown_summary(text: str) -> str:
     safe_source = text.replace("\r\n", "\n").strip()
     if not safe_source:
@@ -1110,8 +1302,7 @@ def render_markdown_summary(text: str) -> str:
             extensions=["extra", "nl2br", "sane_lists"],
             output_format="html5",
         )
-    blocks = [block.strip() for block in safe_source.split("\n\n") if block.strip()]
-    return "\n".join(f"<p>{render_markdown_inline_fallback(block).replace('\n', '<br />')}</p>" for block in blocks)
+    return render_markdown_blocks_fallback(safe_source)
 
 
 def relative_age_label(timestamp: datetime, now: datetime) -> str:
@@ -1155,7 +1346,7 @@ def render_asset_card(asset: Asset, render_now: datetime) -> str:
         f"<div class=\"card mb-4\" data-category=\"{escape(asset.topic)}\" data-pubdate=\"{posted_iso}\">",
         media_card(asset, meme_url),
         "  <div class=\"card-body\">",
-        f"    <p class=\"card-text card-meta-line\"><b>Topic:</b> <a href=\"{topic_url}\">{escape(asset.topic)}</a> <b>Posted:</b> <time class=\"firstseen\" datetime=\"{posted_iso}\" title=\"{posted_iso}\">{posted_label}</time></p>",
+        f"    <p class=\"card-text card-meta-line\"><b>Topic:</b> <a href=\"{topic_url}\">{escape(asset.topic)}</a> <b>Posted:</b> <a class=\"firstseen-link\" href=\"{meme_url}\"><time class=\"firstseen\" datetime=\"{posted_iso}\" title=\"{posted_iso}\">{posted_label}</time></a></p>",
         "  </div>",
         "</div>",
     ]
@@ -1324,13 +1515,9 @@ def main() -> int:
         if args.page_size is not None:
             settings["build"]["page_size"] = max(1, int(args.page_size))
 
-        analysis_enabled = bool(settings.get("ai", {}).get("enabled", False))
-        if not analysis_enabled and isinstance(settings.get("summaries"), dict):
-            analysis_enabled = bool(settings["summaries"].get("enabled", False))
-        if args.summaries == "on":
-            analysis_enabled = True
-        elif args.summaries == "off":
-            analysis_enabled = False
+        summary_selection = parse_summary_selection(args.summaries)
+        enabled_jobs = selected_analysis_jobs(settings, summary_selection)
+        analysis_enabled = bool(enabled_jobs)
 
         print(f"Using settings: {settings_path}")
         print(f"Site: {settings['site']['name']} ({settings['site']['url']})")
@@ -1339,10 +1526,12 @@ def main() -> int:
             ai_settings = settings.get("ai", {}) if isinstance(settings.get("ai"), dict) else {}
             retries = positive_int(ai_settings.get("retries", 3), 3)
             backoff = positive_int(ai_settings.get("retry_backoff_seconds", 2), 2)
-            for job in [cfg for cfg in analysis_configs(settings) if cfg["enabled"]]:
+            for job in enabled_jobs:
                 print(
-                    f"AI job: kind={job['kind']} model={job['model']} timeout_seconds={job['timeout_seconds']} retries={retries} backoff_seconds={backoff}"
+                    f"AI job: kind={job['kind']} url={job['url']} model={job['model']} timeout_seconds={job['timeout_seconds']} retries={retries} backoff_seconds={backoff}"
                 )
+        else:
+            print("AI analysis disabled (--summaries off).")
 
         assets_by_topic = collect_assets(repo_root, settings, None, args.dry_run)
         topic_count = len(assets_by_topic)
@@ -1358,8 +1547,18 @@ def main() -> int:
             print(
                 f"Summary scope limited by --max-topics={max_topics}: {scoped_asset_count} assets across {len(analysis_assets_by_topic)} topics"
             )
+        max_inference_tasks = None
+        if args.max_inference_tasks is not None:
+            max_inference_tasks = max(0, int(args.max_inference_tasks))
+            print(f"Inference scope limited by --max-inference-tasks={max_inference_tasks}")
 
-        attempted, written, failed = maybe_generate_ai_artifacts(analysis_assets_by_topic, settings, analysis_enabled, args.dry_run)
+        attempted, written, failed = maybe_generate_ai_artifacts(
+            analysis_assets_by_topic,
+            settings,
+            enabled_jobs,
+            args.dry_run,
+            max_inference_tasks=max_inference_tasks,
+        )
         if analysis_enabled:
             print(f"AI analysis generation attempted for {attempted} artifacts; wrote {written} files; failed {failed} files")
 
@@ -1389,19 +1588,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

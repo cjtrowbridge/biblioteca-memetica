@@ -17,6 +17,7 @@
 
 # Build/runtime logs
 *.log
+/profiler.txt
 
 # Jekyll build artifacts
 _site/
@@ -26,4 +27,4 @@ _site/
 *.ipynb
 logo.png
 logo.jpg
-memes.json
+/memes.json
