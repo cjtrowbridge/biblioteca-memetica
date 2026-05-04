@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from cicd.entrypoints.run_build_pipeline import run_build_pipeline
+from cicd.entrypoints.run_summarizer_pipeline import run_summarizer_pipeline
 
 
 def main() -> int:
-    return run_build_pipeline()
+    return run_summarizer_pipeline()
 
 
 if __name__ == "__main__":

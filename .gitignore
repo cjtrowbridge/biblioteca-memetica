@@ -6,6 +6,10 @@
 /pages/**
 !/pages/.placeholder
 /__pycache__/**
+**/__pycache__/**
+/cicd/queues/pending/**
+!/cicd/queues/pending/.placeholder
+/cicd/worker/summarize.lock
 
 # Agents and tools
 /kanban/**

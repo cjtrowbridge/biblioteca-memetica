@@ -17,7 +17,11 @@ This project builds a static website from local meme folders.
 
 ## Build Script
 
-Main entrypoint: `build.py`
+Main entrypoint: `build.py` (now a thin CI/CD router wrapper)
+
+Legacy rendering/inference implementation: `legacy_build.py`
+
+Modular orchestration package: `cicd/` (see `cicd/README.md` for module index)
 
 First run creates `settings.local.json` (ignored by git) and prompts for:
 
@@ -44,7 +48,30 @@ python build.py --max-topics 5
 python build.py --dry-run
 python build.py --log-file build-cron.log
 python build.py --jekyll on
+python build.py --generate-ai-task-queues on
+python build.py --queue-output-dir cicd/queues/pending
+python build.py --queue-analyses simple,detailed
 ```
+
+## Queue-Driven Cloud/NAS Workflow
+
+Cloud build host (hourly):
+
+```bash
+python build.py --non-interactive --summaries off --generate-ai-task-queues on --queue-output-dir cicd/queues/pending --jekyll on --log-file build-cron.log
+```
+
+NAS/Xavier summarizer host (periodic):
+
+```bash
+python summarize.py --settings-file settings.local.json --queue-output-dir cicd/queues/pending --simple-limit 20 --detailed-limit 5
+```
+
+Behavior:
+- Cloud build generates newest-first pending task queues for `simple` and `detailed` analyses.
+- NAS summarizer consumes queue heads up to the configured limits.
+- Summarizer re-checks target sidecars immediately before inference to avoid race-condition duplicates.
+- New sidecars sync back and are included on the next cloud build.
 
 ## Generate Missing AI Artifacts
 
@@ -63,6 +90,12 @@ Behavior:
 - Failures are isolated per artifact (the build continues).
 - Any artifact that fails remains missing, so the next run retries it automatically.
 - `--summaries` accepts a CSV list of analysis types to run: `simple`, `detailed`, or `simple,detailed`.
+
+Queue-only generation (no inference calls from cloud):
+
+```bash
+python build.py --non-interactive --summaries off --generate-ai-task-queues on --queue-analyses simple,detailed --queue-output-dir cicd/queues/pending
+```
 
 Optional Jekyll stage:
 
@@ -88,6 +121,19 @@ python build.py --non-interactive --summaries simple,detailed --jekyll on --log-
 - `ai.analyses.simple.timeout_seconds` overrides the simple-description timeout.
 - `ai.analyses.detailed.timeout_seconds` overrides the detailed-analysis timeout.
 - For `gemma3:27b-it-q8_0`, detailed analysis can take several minutes. A tested run completed in about 512 seconds, so `600` is safer than `300`.
+
+## CI/CD Script Governance
+
+Run this after script changes:
+
+```bash
+python scripts/check_cicd_script_length.py
+```
+
+Rules:
+- The checker recursively scans `cicd/**/*.py`.
+- `MAX_LINES_PER_SCRIPT` is defined at the top of the checker as canonical limit.
+- Any file over the limit is a hard failure and must be decomposed before moving on.
 
 Example config snippet:
 
